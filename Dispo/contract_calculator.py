@@ -10,6 +10,11 @@ from bisect import bisect_right
 import pandas as pd
 
 
+MISSING_EXCLUSION_MODE_NONE = 0
+MISSING_EXCLUSION_MODE_AS_AVAILABLE = 1
+MISSING_EXCLUSION_MODE_AS_UNAVAILABLE = 2
+
+
 @dataclass
 class AvailabilityTimeline:
     """Represents availability states on a time range."""
@@ -86,9 +91,33 @@ def build_timeline(
         end_clipped = min(end_ts, end)
         if pd.isna(start_clipped) or pd.isna(end_clipped) or start_clipped >= end_clipped:
             continue
-        available = int(row.get("est_disponible", 0))
-        is_excluded = int(row.get("is_excluded", 0))
-        records.append((start_clipped, end_clipped, available, is_excluded))
+        raw_available = int(row.get("est_disponible", 0))
+        raw_is_excluded = int(row.get("is_excluded", 0))
+        missing_mode = int(
+            row.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE)
+        )
+
+        effective_available = 1 if raw_available == 1 else 0
+        effective_is_excluded = raw_is_excluded
+
+        if raw_available == 0 and raw_is_excluded == 1:
+            # Un bloc indisponible mais exclu compte comme disponible.
+            effective_available = 1
+            effective_is_excluded = 0
+        elif raw_available == -1:
+            if missing_mode == MISSING_EXCLUSION_MODE_AS_AVAILABLE:
+                effective_available = 1
+                effective_is_excluded = 0
+            elif missing_mode == MISSING_EXCLUSION_MODE_AS_UNAVAILABLE:
+                effective_available = 0
+                effective_is_excluded = 0
+            else:
+                effective_available = 0
+                effective_is_excluded = 0
+
+        records.append(
+            (start_clipped, end_clipped, effective_available, effective_is_excluded)
+        )
 
     records.sort(key=lambda item: item[0])
     return AvailabilityTimeline(records)
