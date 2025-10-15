@@ -101,6 +101,22 @@ MISSING_EXCLUSION_MODE_LABELS = {
 }
 
 
+RECLASSIFICATION_HISTORY_TABLE = "dispo_reclassification_history"
+
+
+@dataclass
+class BlockRecordLocation:
+    """Represents the physical storage of a timeline block."""
+
+    table_name: str
+    status_column: str
+    record_id: int
+    current_status: int
+
+
+_RECLASS_HISTORY_INITIALISED = False
+
+
 def format_exclusion_status(row: pd.Series) -> str:
     """Retourne une étiquette lisible pour l'état d'exclusion d'un bloc."""
 
@@ -751,6 +767,320 @@ def _insert_annotation(
         "user": user
     }
     return execute_write(query, params)
+
+
+def _format_table_identifier(name: str) -> str:
+    """Return a safely quoted table identifier."""
+
+    parts = [part for part in str(name).split(".") if part]
+    return ".".join(f"`{part}`" for part in parts)
+
+
+def _fully_qualified_table(name: str) -> str:
+    """Return the fully qualified table name within the current schema."""
+
+    if "." in str(name):
+        return _format_table_identifier(name)
+    db = get_db_config()["database"]
+    return _format_table_identifier(f"{db}.{name}")
+
+
+def _ensure_reclassification_history_table() -> None:
+    """Create the history table once per session."""
+
+    global _RECLASS_HISTORY_INITIALISED
+    if _RECLASS_HISTORY_INITIALISED:
+        return
+
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS {_fully_qualified_table(RECLASSIFICATION_HISTORY_TABLE)} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            table_name VARCHAR(128) NOT NULL,
+            record_id BIGINT UNSIGNED NOT NULL,
+            hash_signature VARCHAR(64) NOT NULL,
+            site VARCHAR(100) NOT NULL,
+            equipement_id VARCHAR(100) NOT NULL,
+            date_debut DATETIME NOT NULL,
+            date_fin DATETIME NOT NULL,
+            previous_status TINYINT NOT NULL,
+            new_status TINYINT NOT NULL,
+            raw_status TINYINT NOT NULL,
+            raw_is_excluded TINYINT NOT NULL,
+            changed_by VARCHAR(100) NOT NULL,
+            reason TEXT NOT NULL,
+            mode VARCHAR(16) NOT NULL,
+            changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_reclass_hash (hash_signature),
+            KEY idx_reclass_table_record (table_name, record_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """
+
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+    _RECLASS_HISTORY_INITIALISED = True
+
+
+def _candidate_tables_for_row(row: pd.Series, mode: str) -> List[Tuple[str, str]]:
+    """Return potential physical tables for a given block."""
+
+    candidates: List[Tuple[str, str]] = []
+    site_value = str(row.get("site", "") or "").strip()
+    equip_value = str(row.get("equipement_id", "") or "").strip()
+    type_value = str(row.get("type_equipement", "") or "").strip().upper()
+
+    if mode == MODE_PDC:
+        try:
+            tables = _list_pdc_tables()
+        except DatabaseError:
+            tables = pd.DataFrame(columns=["site_code", "pdc_id", "table_name"])
+        if tables.empty:
+            return candidates
+
+        subset = tables.copy()
+        if site_value:
+            mask = subset["site_code"].astype(str).str.lower() == site_value.lower()
+            subset = subset[mask]
+            if subset.empty:
+                subset = tables[mask]
+        if equip_value:
+            mask = subset["pdc_id"].astype(str).str.upper() == equip_value.upper()
+            subset = subset[mask]
+            if subset.empty:
+                subset = tables[tables["pdc_id"].astype(str).str.upper() == equip_value.upper()]
+
+        for tbl in subset["table_name"].dropna().unique().tolist():
+            candidates.append((tbl, "etat"))
+        return candidates
+
+    try:
+        ac_tables = _list_ac_tables()
+    except DatabaseError:
+        ac_tables = pd.DataFrame(columns=["site_code", "table_name"])
+    try:
+        batt_tables = _list_batt_tables()
+    except DatabaseError:
+        batt_tables = pd.DataFrame(columns=["site_code", "kind", "table_name"])
+
+    if type_value == "AC" or equip_value.upper().startswith("AC"):
+        subset = ac_tables
+        if not ac_tables.empty and site_value:
+            mask = ac_tables["site_code"].astype(str).str.lower() == site_value.lower()
+            subset = ac_tables[mask]
+            if subset.empty:
+                subset = ac_tables
+        for tbl in subset.get("table_name", pd.Series(dtype=str)).dropna().unique().tolist():
+            candidates.append((tbl, "est_disponible"))
+        return candidates
+
+    if batt_tables.empty:
+        return candidates
+
+    if type_value in {"BATT", "DC1"}:
+        subset = batt_tables[batt_tables["kind"] == "batt"]
+    elif type_value in {"BATT2", "DC2"}:
+        subset = batt_tables[batt_tables["kind"] == "batt2"]
+    else:
+        subset = batt_tables
+
+    if not subset.empty and site_value:
+        mask = subset["site_code"].astype(str).str.lower() == site_value.lower()
+        filtered = subset[mask]
+        if not filtered.empty:
+            subset = filtered
+
+    for tbl in subset.get("table_name", pd.Series(dtype=str)).dropna().unique().tolist():
+        candidates.append((tbl, "est_disponible"))
+
+    return candidates
+
+
+def _locate_block_record(row: pd.Series, mode: str) -> Optional[BlockRecordLocation]:
+    """Locate the storage record associated with a dataframe row."""
+
+    hash_signature = str(row.get("hash_signature", "") or "").strip()
+    if not hash_signature:
+        return None
+
+    candidates = _candidate_tables_for_row(row, mode)
+    if not candidates:
+        return None
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        for table_name, status_column in candidates:
+            table_identifier = _fully_qualified_table(table_name)
+            query = text(
+                f"SELECT id, {status_column} AS status_value FROM {table_identifier} "
+                "WHERE hash_signature = :hash LIMIT 1"
+            )
+            try:
+                result = conn.execute(query, {"hash": hash_signature}).fetchone()
+            except SQLAlchemyError:
+                continue
+            if result:
+                record_id = int(result[0])
+                current_status = int(result[1]) if result[1] is not None else 0
+                return BlockRecordLocation(
+                    table_name=table_name,
+                    status_column=status_column,
+                    record_id=record_id,
+                    current_status=current_status,
+                )
+
+    return None
+
+
+def _to_naive_datetime(value: Any) -> datetime:
+    """Convert a series value to a naive datetime."""
+
+    if isinstance(value, pd.Timestamp):
+        ts = value
+    else:
+        ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError("Invalid datetime value")
+    if ts.tzinfo is not None:
+        try:
+            ts = ts.tz_convert("Europe/Paris")
+        except Exception:
+            ts = ts.tz_convert("UTC")
+        ts = ts.tz_localize(None)
+    return ts.to_pydatetime()
+
+
+def get_reclassification_options(row: pd.Series) -> List[Tuple[int, str]]:
+    """Return the list of allowed target statuses for a block."""
+
+    try:
+        raw_status = int(row.get("raw_est_disponible", row.get("est_disponible", 0)))
+    except (TypeError, ValueError):
+        raw_status = 0
+    try:
+        raw_excluded = int(row.get("raw_is_excluded", row.get("is_excluded", 0)))
+    except (TypeError, ValueError):
+        raw_excluded = 0
+
+    options: List[Tuple[int, str]] = []
+    if raw_status == -1:
+        options.append((1, "Reclasser en disponible"))
+        options.append((0, "Reclasser en indisponible"))
+    elif raw_status == 0 and raw_excluded == 1:
+        options.append((1, "Reclasser en disponible"))
+
+    return options
+
+
+def reclassify_block(
+    row: pd.Series,
+    new_status: int,
+    operator: str,
+    reason: str,
+    mode: str,
+) -> bool:
+    """Apply the reclassification rules and persist the change."""
+
+    allowed_targets = {value for value, _ in get_reclassification_options(row)}
+    if new_status not in allowed_targets:
+        st.error("❌ Reclassement non autorisé pour ce bloc.")
+        return False
+
+    location = _locate_block_record(row, mode)
+    if not location:
+        st.error("❌ Impossible d'identifier le bloc dans la base de données.")
+        return False
+
+    if location.current_status == new_status:
+        st.info("ℹ️ Le bloc est déjà dans le statut sélectionné.")
+        return True
+
+    try:
+        _ensure_reclassification_history_table()
+    except SQLAlchemyError as exc:
+        logger.error("Erreur lors de la préparation de la table d'historique: %s", exc)
+        st.error(f"❌ Impossible de préparer l'historique: {exc}")
+        return False
+
+    hash_signature = str(row.get("hash_signature", "") or "")
+    site = str(row.get("site", "") or "")
+    equipement_id = str(row.get("equipement_id", "") or "")
+    try:
+        start_dt = _to_naive_datetime(row.get("date_debut"))
+        end_dt = _to_naive_datetime(row.get("date_fin"))
+    except ValueError as exc:
+        st.error(f"❌ Dates invalides pour le bloc sélectionné: {exc}")
+        return False
+
+    try:
+        raw_status = int(row.get("raw_est_disponible", row.get("est_disponible", 0)))
+    except (TypeError, ValueError):
+        raw_status = location.current_status
+    try:
+        raw_is_excluded = int(row.get("raw_is_excluded", row.get("is_excluded", 0)))
+    except (TypeError, ValueError):
+        raw_is_excluded = 0
+
+    operator_clean = (operator or "Utilisateur UI").strip()[:100]
+    reason_clean = reason.strip()
+
+    engine = get_engine()
+    table_identifier = _fully_qualified_table(location.table_name)
+    history_table = _fully_qualified_table(RECLASSIFICATION_HISTORY_TABLE)
+
+    try:
+        with engine.begin() as conn:
+            update_query = text(
+                f"UPDATE {table_identifier} SET {location.status_column} = :new_status "
+                "WHERE id = :record_id"
+            )
+            result = conn.execute(
+                update_query,
+                {"new_status": int(new_status), "record_id": int(location.record_id)},
+            )
+            if result.rowcount == 0:
+                raise RuntimeError("Aucun enregistrement mis à jour.")
+
+            history_query = text(
+                f"""
+                INSERT INTO {history_table}
+                (table_name, record_id, hash_signature, site, equipement_id, date_debut, date_fin,
+                 previous_status, new_status, raw_status, raw_is_excluded, changed_by, reason, mode)
+                VALUES (:table_name, :record_id, :hash_signature, :site, :equipement_id, :date_debut, :date_fin,
+                        :previous_status, :new_status, :raw_status, :raw_is_excluded, :changed_by, :reason, :mode)
+                """
+            )
+            conn.execute(
+                history_query,
+                {
+                    "table_name": location.table_name,
+                    "record_id": int(location.record_id),
+                    "hash_signature": hash_signature,
+                    "site": site,
+                    "equipement_id": equipement_id,
+                    "date_debut": start_dt,
+                    "date_fin": end_dt,
+                    "previous_status": int(location.current_status),
+                    "new_status": int(new_status),
+                    "raw_status": int(raw_status),
+                    "raw_is_excluded": int(raw_is_excluded),
+                    "changed_by": operator_clean or "Utilisateur UI",
+                    "reason": reason_clean,
+                    "mode": mode,
+                },
+            )
+    except SQLAlchemyError as exc:
+        logger.error("Erreur SQL lors du reclassement: %s", exc)
+        st.error(f"❌ Échec du reclassement: {exc}")
+        return False
+    except Exception as exc:
+        logger.error("Erreur inattendue lors du reclassement: %s", exc)
+        st.error(f"❌ Erreur inattendue: {exc}")
+        return False
+
+    invalidate_cache()
+    return True
 
 
 def create_annotation(
@@ -3283,6 +3613,53 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                     st.success(f"✅ {choice_labels.get(annotation_type, annotation_type)} ajoutée avec succès !")
                     st.balloons()
                     st.rerun()
+
+        reclass_options = get_reclassification_options(selected_row)
+        if reclass_options:
+            st.subheader("🔄 Reclasser le bloc sélectionné")
+            reclass_map = {value: label for value, label in reclass_options}
+            option_values = [value for value, _ in reclass_options]
+            with st.form(f"reclassification_form_{selected_idx}"):
+                target_status = st.radio(
+                    "Nouveau statut",
+                    options=option_values,
+                    index=0,
+                    horizontal=True,
+                    format_func=lambda val: reclass_map.get(val, str(val)),
+                    help="Sélectionnez le statut final appliqué directement en base.",
+                )
+                operator_name = st.text_input(
+                    "Opérateur",
+                    value="",
+                    placeholder="Nom de l'opérateur",
+                    help="Identifiez la personne à l'origine du reclassement.",
+                    key=f"reclass_operator_{selected_idx}",
+                )
+                reclass_reason = st.text_area(
+                    "Motif du reclassement",
+                    value="",
+                    placeholder="Décrivez la raison du reclassement (minimum 10 caractères).",
+                    help="Obligatoire pour assurer la traçabilité des modifications.",
+                    key=f"reclass_reason_{selected_idx}",
+                )
+                confirm_reclass = st.form_submit_button("💾 Appliquer le reclassement")
+
+            if confirm_reclass:
+                reason_clean = reclass_reason.strip()
+                if len(reason_clean) < 10:
+                    st.error("❌ Le motif doit contenir au moins 10 caractères.")
+                else:
+                    success = reclassify_block(
+                        row=selected_row,
+                        new_status=int(target_status),
+                        operator=operator_name.strip() or "Utilisateur UI",
+                        reason=reason_clean,
+                        mode=mode,
+                    )
+                    if success:
+                        st.success("✅ Bloc reclassé avec succès !")
+                        st.balloons()
+                        st.rerun()
 
     with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
         month_default = datetime.utcnow().date().replace(day=1)
