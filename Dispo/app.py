@@ -1144,11 +1144,27 @@ def _aggregate_monthly_availability(
             continue
 
         avail_brut = int(group.loc[group["est_disponible"] == 1, "duration_minutes_window"].sum())
+        if "missing_exclusion_mode" in group.columns:
+            missing_mode_series = group["missing_exclusion_mode"].astype(int)
+        else:
+            missing_mode_series = pd.Series(
+                MISSING_EXCLUSION_MODE_NONE, index=group.index
+            )
+
+        available_mask = (
+            (group["est_disponible"] == 1)
+            | (
+                (group["est_disponible"] == 0)
+                & (group["is_excluded"] == 1)
+            )
+            | (
+                (group["est_disponible"] == -1)
+                & (missing_mode_series == MISSING_EXCLUSION_MODE_AS_AVAILABLE)
+            )
+        )
+
         avail_excl = int(
-            group.loc[
-                (group["est_disponible"] == 1) | (group["is_excluded"] == 1),
-                "duration_minutes_window",
-            ].sum()
+            group.loc[available_mask, "duration_minutes_window"].sum()
         )
 
         rows.append(
