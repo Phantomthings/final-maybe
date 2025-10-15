@@ -16,6 +16,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from Projects import mapping_sites
 from Binaire import get_equip_config, translate_ic_pc
+from contract_calculator import (
+    MISSING_EXCLUSION_MODE_AS_AVAILABLE,
+    MISSING_EXCLUSION_MODE_AS_UNAVAILABLE,
+    MISSING_EXCLUSION_MODE_NONE,
+    inject_effective_status,
+)
 
 # Config
 logging.basicConfig(
@@ -73,10 +79,6 @@ MISSING_AVAILABLE_ANNOTATION_TYPES: Tuple[str, ...] = _unique_preserve_order(
     )
 )
 
-MISSING_EXCLUSION_MODE_NONE = 0
-MISSING_EXCLUSION_MODE_AS_AVAILABLE = 1
-MISSING_EXCLUSION_MODE_AS_UNAVAILABLE = 2
-
 ANNOTATION_EXCLUSION_TYPES_SQL = ", ".join(f"'{t}'" for t in EXCLUSION_ANNOTATION_TYPES)
 ANNOTATION_MISSING_AVAILABLE_SQL = ", ".join(
     f"'{t}'" for t in MISSING_AVAILABLE_ANNOTATION_TYPES
@@ -101,17 +103,24 @@ MISSING_EXCLUSION_MODE_LABELS = {
 
 def format_exclusion_status(row: pd.Series) -> str:
     """Retourne une étiquette lisible pour l'état d'exclusion d'un bloc."""
-    is_excluded = int(row.get("is_excluded", 0))
-    if is_excluded != 1:
+
+    effective_exclusion = int(row.get("is_excluded", 0))
+    raw_exclusion = int(row.get("raw_is_excluded", effective_exclusion))
+    if raw_exclusion != 1:
         return "❌ Non"
 
-    status = int(row.get("est_disponible", 0))
-    if status == -1:
-        mode_value = int(row.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE))
+    raw_status = int(row.get("raw_est_disponible", row.get("est_disponible", 0)))
+    mode_value = int(row.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE))
+
+    if raw_status == -1:
         if mode_value == MISSING_EXCLUSION_MODE_AS_UNAVAILABLE:
             return "✅ Oui (→ Indispo)"
         if mode_value == MISSING_EXCLUSION_MODE_AS_AVAILABLE:
             return "✅ Oui (→ Dispo)"
+
+    if raw_status == 0 and effective_exclusion == 0:
+        return "✅ Oui (→ Dispo)"
+
     return "✅ Oui"
 
 
@@ -1092,10 +1101,14 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
                 out[col] = 0
             elif col == "missing_exclusion_mode":
                 out[col] = MISSING_EXCLUSION_MODE_NONE
-    if "is_excluded" in out.columns and "est_disponible" in out.columns:
-        out.loc[out["est_disponible"] == 1, "is_excluded"] = 0
-    if "missing_exclusion_mode" in out.columns and "est_disponible" in out.columns:
-        out.loc[out["est_disponible"] != -1, "missing_exclusion_mode"] = MISSING_EXCLUSION_MODE_NONE
+
+    out = inject_effective_status(out)
+
+    # Reset the annotation mode for blocks that effectively carry a definitive status.
+    if "missing_exclusion_mode" in out.columns and "raw_est_disponible" in out.columns:
+        mask_non_missing = out["raw_est_disponible"] != -1
+        out.loc[mask_non_missing, "missing_exclusion_mode"] = MISSING_EXCLUSION_MODE_NONE
+
     return out.sort_values("date_debut").reset_index(drop=True)
 
 
@@ -1143,28 +1156,13 @@ def _aggregate_monthly_availability(
             rows.append({"month": month, "pct_brut": 0.0, "pct_excl": 0.0, "total_minutes": 0})
             continue
 
-        avail_brut = int(group.loc[group["est_disponible"] == 1, "duration_minutes_window"].sum())
-        if "missing_exclusion_mode" in group.columns:
-            missing_mode_series = group["missing_exclusion_mode"].astype(int)
-        else:
-            missing_mode_series = pd.Series(
-                MISSING_EXCLUSION_MODE_NONE, index=group.index
-            )
-
-        available_mask = (
-            (group["est_disponible"] == 1)
-            | (
-                (group["est_disponible"] == 0)
-                & (group["is_excluded"] == 1)
-            )
-            | (
-                (group["est_disponible"] == -1)
-                & (missing_mode_series == MISSING_EXCLUSION_MODE_AS_AVAILABLE)
-            )
+        raw_status = group.get("raw_est_disponible", group["est_disponible"])
+        avail_brut = int(
+            group.loc[raw_status == 1, "duration_minutes_window"].sum()
         )
 
         avail_excl = int(
-            group.loc[available_mask, "duration_minutes_window"].sum()
+            group.loc[group["est_disponible"] == 1, "duration_minutes_window"].sum()
         )
 
         rows.append(
@@ -1231,15 +1229,18 @@ def calculate_availability(
 
     total_all = int(df["duration_minutes"].sum())
 
+    raw_status = df.get("raw_est_disponible", df["est_disponible"])
+    raw_exclusion = df.get("raw_is_excluded", df["is_excluded"])
+
     missing_total = int(
         df.loc[
-            df["est_disponible"] == -1,
+            raw_status == -1,
             "duration_minutes",
         ].sum()
     )
     missing_excluded = int(
         df.loc[
-            (df["est_disponible"] == -1) & (df["is_excluded"] == 1),
+            (raw_status == -1) & (raw_exclusion == 1),
             "duration_minutes",
         ].sum()
     )
@@ -1254,27 +1255,11 @@ def calculate_availability(
     missing_minutes = missing_not_excluded
 
     if include_exclusions:
-        if "missing_exclusion_mode" in df.columns:
-            missing_mode_series = df["missing_exclusion_mode"].astype(int)
-        else:
-            missing_mode_series = pd.Series(MISSING_EXCLUSION_MODE_NONE, index=df.index)
-        available_mask = (
-            (df["est_disponible"] == 1)
-            | ((df["est_disponible"] == 0) & (df["is_excluded"] == 1))
-            | (
-                (df["est_disponible"] == -1)
-                & (missing_mode_series == MISSING_EXCLUSION_MODE_AS_AVAILABLE)
-            )
-        )
-        unavailable_mask = (
-            (df["est_disponible"] == 0) & (df["is_excluded"] == 0)
-        ) | (
-            (df["est_disponible"] == -1)
-            & (missing_mode_series == MISSING_EXCLUSION_MODE_AS_UNAVAILABLE)
-        )
-    else:
         available_mask = df["est_disponible"] == 1
         unavailable_mask = df["est_disponible"] == 0
+    else:
+        available_mask = raw_status == 1
+        unavailable_mask = raw_status == 0
 
     available = int(df.loc[available_mask, "duration_minutes"].sum())
     unavailable = int(df.loc[unavailable_mask, "duration_minutes"].sum())
@@ -1335,13 +1320,19 @@ def _build_station_timeline_df(timelines: Dict[str, pd.DataFrame]) -> pd.DataFra
             end_ts = _ensure_paris_timestamp(row.get("date_fin"))
             if start_ts is None or end_ts is None or end_ts <= start_ts:
                 continue
+            effective_status = int(row.get("est_disponible", 0))
+            effective_exclusion = int(row.get("is_excluded", 0))
+            raw_status = int(row.get("raw_est_disponible", effective_status))
+            raw_exclusion = int(row.get("raw_is_excluded", effective_exclusion))
             records.append(
                 {
                     "Equipement": equip,
                     "start": start_ts,
                     "end": end_ts,
-                    "est_disponible": int(row.get("est_disponible", 0)),
-                    "is_excluded": int(row.get("is_excluded", 0)),
+                    "est_disponible": effective_status,
+                    "is_excluded": effective_exclusion,
+                    "raw_est_disponible": raw_status,
+                    "raw_is_excluded": raw_exclusion,
                     "missing_exclusion_mode": int(row.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE)),
                     "cause": row.get("cause"),
                     "duration_minutes": int(row.get("duration_minutes", 0)),
@@ -1358,19 +1349,32 @@ def _build_station_timeline_df(timelines: Dict[str, pd.DataFrame]) -> pd.DataFra
 
     def _label(row: pd.Series) -> str:
         status = int(row.get("est_disponible", 0))
-        is_excl = int(row.get("is_excluded", 0))
+        raw_status = int(row.get("raw_est_disponible", status))
+        effective_excl = int(row.get("is_excluded", 0))
+        raw_excl = int(row.get("raw_is_excluded", effective_excl))
+        mode_value = int(row.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE))
+
         if status == 1:
+            if raw_status == 0 and raw_excl == 1:
+                return "✅ Disponible (Indispo exclue)"
+            if raw_status == -1 and mode_value == MISSING_EXCLUSION_MODE_AS_AVAILABLE:
+                return "✅ Disponible (Donnée exclue)"
             return "✅ Disponible"
+
         if status == 0:
-            return "❌ Indisponible (Exclu)" if is_excl == 1 else "❌ Indisponible"
+            if raw_status == -1 and mode_value == MISSING_EXCLUSION_MODE_AS_UNAVAILABLE:
+                return "❌ Indisponible (Donnée exclue)"
+            return "❌ Indisponible (Exclu)" if effective_excl == 1 else "❌ Indisponible"
+
         if status == -1:
-            mode_value = int(row.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE))
-            if is_excl == 1:
+            if effective_excl == 1:
                 if mode_value == MISSING_EXCLUSION_MODE_AS_UNAVAILABLE:
                     return "⚠️ Donnée manquante (Exclu indisponible)"
-                return "⚠️ Donnée manquante (Exclu disponible)"
+                if mode_value == MISSING_EXCLUSION_MODE_AS_AVAILABLE:
+                    return "⚠️ Donnée manquante (Exclu disponible)"
             return "⚠️ Donnée manquante"
-        return "❓ Inconnu (Exclu)" if is_excl == 1 else "❓ Inconnu"
+
+        return "❓ Inconnu (Exclu)" if effective_excl == 1 else "❓ Inconnu"
 
     timeline_df["label"] = timeline_df.apply(_label, axis=1)
     return timeline_df.sort_values(["Equipement", "start"]).reset_index(drop=True)

@@ -21,6 +21,7 @@ from contract_calculator import (
     MISSING_EXCLUSION_MODE_AS_AVAILABLE,
     MISSING_EXCLUSION_MODE_AS_UNAVAILABLE,
     MISSING_EXCLUSION_MODE_NONE,
+    inject_effective_status,
 )
 
 
@@ -152,13 +153,13 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
                 out[col] = 0
             elif col == "missing_exclusion_mode":
                 out[col] = MISSING_EXCLUSION_MODE_NONE
-    if "is_excluded" in out.columns and "est_disponible" in out.columns:
-        out.loc[out["est_disponible"] == 1, "is_excluded"] = 0
-    if "missing_exclusion_mode" in out.columns and "est_disponible" in out.columns:
-        out.loc[
-            out["est_disponible"] != -1,
-            "missing_exclusion_mode",
-        ] = MISSING_EXCLUSION_MODE_NONE
+
+    out = inject_effective_status(out)
+
+    if "missing_exclusion_mode" in out.columns and "raw_est_disponible" in out.columns:
+        mask_non_missing = out["raw_est_disponible"] != -1
+        out.loc[mask_non_missing, "missing_exclusion_mode"] = MISSING_EXCLUSION_MODE_NONE
+
     return out.sort_values("date_debut").reset_index(drop=True)
 
 
