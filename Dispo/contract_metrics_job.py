@@ -18,6 +18,64 @@ from contract_calculator import (
     IntervalCollection,
     build_timeline,
     localize_to_paris,
+    MISSING_EXCLUSION_MODE_AS_AVAILABLE,
+    MISSING_EXCLUSION_MODE_AS_UNAVAILABLE,
+    MISSING_EXCLUSION_MODE_NONE,
+    inject_effective_status,
+)
+
+
+def _unique_preserve_order(values: Tuple[str, ...]) -> Tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
+ANNOTATION_TYPE_EXCLUSION = "exclusion"
+ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE = "miss_ex_av"
+ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE_V2 = "missing_ex_avail"
+ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE_LEGACY = "missing_excl_available"
+ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE = "miss_ex_unav"
+ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE_V2 = "missing_ex_unavail"
+ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE_LEGACY = "missing_excl_unavailable"
+
+MISSING_EXCLUSION_ANNOTATION_TYPES: Tuple[str, ...] = _unique_preserve_order(
+    (
+        ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE,
+        ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE,
+        ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE_V2,
+        ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE_V2,
+        ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE_LEGACY,
+        ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE_LEGACY,
+    )
+)
+
+EXCLUSION_ANNOTATION_TYPES: Tuple[str, ...] = _unique_preserve_order(
+    (ANNOTATION_TYPE_EXCLUSION, *MISSING_EXCLUSION_ANNOTATION_TYPES)
+)
+
+MISSING_AVAILABLE_ANNOTATION_TYPES: Tuple[str, ...] = _unique_preserve_order(
+    (
+        ANNOTATION_TYPE_EXCLUSION,
+        ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE,
+        ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE_V2,
+        ANNOTATION_TYPE_MISSING_EXCL_AVAILABLE_LEGACY,
+    )
+)
+
+ANNOTATION_EXCLUSION_TYPES_SQL = ", ".join(
+    f"'{typ}'" for typ in EXCLUSION_ANNOTATION_TYPES
+)
+ANNOTATION_MISSING_AVAILABLE_SQL = ", ".join(
+    f"'{typ}'" for typ in MISSING_AVAILABLE_ANNOTATION_TYPES
+)
+ANNOTATION_MISSING_UNAVAILABLE_SQL = ", ".join(
+    f"'{typ}'"
+    for typ in _unique_preserve_order(
+        (
+            ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE,
+            ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE_V2,
+            ANNOTATION_TYPE_MISSING_EXCL_UNAVAILABLE_LEGACY,
+        )
+    )
 )
 
 logger = logging.getLogger("contract_job")
@@ -81,12 +139,27 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
             except Exception:
                 pass
             out[col] = series
-    for col in ["est_disponible", "raw_point_count", "duration_minutes", "is_excluded"]:
+    for col in [
+        "est_disponible",
+        "raw_point_count",
+        "duration_minutes",
+        "is_excluded",
+        "missing_exclusion_mode",
+    ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
         else:
             if col == "is_excluded":
                 out[col] = 0
+            elif col == "missing_exclusion_mode":
+                out[col] = MISSING_EXCLUSION_MODE_NONE
+
+    out = inject_effective_status(out)
+
+    if "missing_exclusion_mode" in out.columns and "raw_est_disponible" in out.columns:
+        mask_non_missing = out["raw_est_disponible"] != -1
+        out.loc[mask_non_missing, "missing_exclusion_mode"] = MISSING_EXCLUSION_MODE_NONE
+
     return out.sort_values("date_debut").reset_index(drop=True)
 
 
@@ -310,14 +383,34 @@ def _load_filtered_blocks_equipment(
           b.batch_id,
           b.hash_signature,
           TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
-          CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1
-              AND a.type_annotation = 'exclusion'
-              AND a.site = b.site
-              AND a.equipement_id = b.equipement_id
-              AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-          ) AS UNSIGNED) AS is_excluded
+          CASE
+            WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
+              SELECT 1 FROM dispo_annotations a
+              WHERE a.actif = 1
+                AND a.type_annotation IN ({ANNOTATION_EXCLUSION_TYPES_SQL})
+                AND a.site = b.site
+                AND a.equipement_id = b.equipement_id
+                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
+            ) AS UNSIGNED)
+            ELSE 0
+          END AS is_excluded,
+          CASE
+            WHEN b.est_disponible = -1 THEN (
+              SELECT COALESCE(MAX(
+                CASE
+                  WHEN a.type_annotation IN ({ANNOTATION_MISSING_UNAVAILABLE_SQL}) THEN {MISSING_EXCLUSION_MODE_AS_UNAVAILABLE}
+                  WHEN a.type_annotation IN ({ANNOTATION_MISSING_AVAILABLE_SQL}) THEN {MISSING_EXCLUSION_MODE_AS_AVAILABLE}
+                  ELSE {MISSING_EXCLUSION_MODE_NONE}
+                END
+              ), {MISSING_EXCLUSION_MODE_NONE})
+              FROM dispo_annotations a
+              WHERE a.actif = 1
+                AND a.site = b.site
+                AND a.equipement_id = b.equipement_id
+                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
+            )
+            ELSE {MISSING_EXCLUSION_MODE_NONE}
+          END AS missing_exclusion_mode
         FROM base b
         WHERE b.site = :site
           AND b.equipement_id = :equip
@@ -355,14 +448,34 @@ def _load_filtered_blocks_pdc(
           p.batch_id,
           p.hash_signature,
           TIMESTAMPDIFF(MINUTE, p.date_debut, p.date_fin) AS duration_minutes,
-          CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1
-              AND a.type_annotation = 'exclusion'
-              AND a.site = p.site
-              AND a.equipement_id = p.equipement_id
-              AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-          ) AS UNSIGNED) AS is_excluded
+          CASE
+            WHEN p.est_disponible <> 1 THEN CAST(EXISTS (
+              SELECT 1 FROM dispo_annotations a
+              WHERE a.actif = 1
+                AND a.type_annotation IN ({ANNOTATION_EXCLUSION_TYPES_SQL})
+                AND a.site = p.site
+                AND a.equipement_id = p.equipement_id
+                AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
+            ) AS UNSIGNED)
+            ELSE 0
+          END AS is_excluded,
+          CASE
+            WHEN p.est_disponible = -1 THEN (
+              SELECT COALESCE(MAX(
+                CASE
+                  WHEN a.type_annotation IN ({ANNOTATION_MISSING_UNAVAILABLE_SQL}) THEN {MISSING_EXCLUSION_MODE_AS_UNAVAILABLE}
+                  WHEN a.type_annotation IN ({ANNOTATION_MISSING_AVAILABLE_SQL}) THEN {MISSING_EXCLUSION_MODE_AS_AVAILABLE}
+                  ELSE {MISSING_EXCLUSION_MODE_NONE}
+                END
+              ), {MISSING_EXCLUSION_MODE_NONE})
+              FROM dispo_annotations a
+              WHERE a.actif = 1
+                AND a.site = p.site
+                AND a.equipement_id = p.equipement_id
+                AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
+            )
+            ELSE {MISSING_EXCLUSION_MODE_NONE}
+          END AS missing_exclusion_mode
         FROM pdc p
         WHERE p.site = :site
           AND p.equipement_id = :equip

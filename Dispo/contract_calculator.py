@@ -10,6 +10,92 @@ from bisect import bisect_right
 import pandas as pd
 
 
+MISSING_EXCLUSION_MODE_NONE = 0
+MISSING_EXCLUSION_MODE_AS_AVAILABLE = 1
+MISSING_EXCLUSION_MODE_AS_UNAVAILABLE = 2
+
+
+def resolve_effective_status(
+    status: int,
+    is_excluded: int,
+    missing_mode: int = MISSING_EXCLUSION_MODE_NONE,
+) -> Tuple[int, int]:
+    """Return the effective (status, is_excluded) tuple for a block.
+
+    The rules follow the product requirements:
+
+    * an excluded unavailable block becomes available and is not counted as excluded;
+    * a missing block that is excluded as available/unavailable adopts that status;
+    * other blocks keep their original status while exclusions are cleared when the
+      block is effectively available.
+    """
+
+    raw_status = int(status)
+    raw_exclusion = 1 if int(is_excluded) == 1 else 0
+    mode = int(missing_mode)
+
+    if raw_status == 1:
+        # Available blocks are never considered excluded in the effective timeline.
+        return 1, 0
+
+    if raw_status == 0:
+        if raw_exclusion == 1:
+            # Manually excluded unavailable blocks are rehabilitated as available.
+            return 1, 0
+        return 0, 0
+
+    if raw_status == -1:
+        if mode == MISSING_EXCLUSION_MODE_AS_AVAILABLE:
+            return 1, 0
+        if mode == MISSING_EXCLUSION_MODE_AS_UNAVAILABLE:
+            return 0, 0
+        return -1, 0
+
+    return raw_status, raw_exclusion
+
+
+def inject_effective_status(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Attach raw/effective status columns to a dataframe of availability blocks."""
+
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    out = df.copy()
+
+    raw_status = pd.to_numeric(out.get("est_disponible", 0), errors="coerce").fillna(0).astype(int)
+    raw_excluded = (
+        pd.to_numeric(out.get("is_excluded", 0), errors="coerce").fillna(0).astype(int)
+    )
+    missing_mode = (
+        pd.to_numeric(
+            out.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE),
+            errors="coerce",
+        )
+        .fillna(MISSING_EXCLUSION_MODE_NONE)
+        .astype(int)
+    )
+
+    effective_status: List[int] = []
+    effective_exclusion: List[int] = []
+
+    for status, exclusion, mode in zip(raw_status, raw_excluded, missing_mode):
+        eff_status, eff_excl = resolve_effective_status(status, exclusion, mode)
+        effective_status.append(int(eff_status))
+        effective_exclusion.append(int(eff_excl))
+
+    out["raw_est_disponible"] = raw_status
+    out["raw_is_excluded"] = raw_excluded
+    out["effective_est_disponible"] = pd.Series(effective_status, index=out.index).astype(int)
+    out["effective_is_excluded"] = pd.Series(effective_exclusion, index=out.index).astype(int)
+
+    # Normalise the working columns in place so downstream code naturally consumes the
+    # effective states while still exposing the raw information for audit purposes.
+    out["est_disponible"] = out["effective_est_disponible"]
+    out["is_excluded"] = out["effective_is_excluded"]
+
+    return out
+
+
 @dataclass
 class AvailabilityTimeline:
     """Represents availability states on a time range."""
@@ -86,9 +172,20 @@ def build_timeline(
         end_clipped = min(end_ts, end)
         if pd.isna(start_clipped) or pd.isna(end_clipped) or start_clipped >= end_clipped:
             continue
-        available = int(row.get("est_disponible", 0))
-        is_excluded = int(row.get("is_excluded", 0))
-        records.append((start_clipped, end_clipped, available, is_excluded))
+        raw_available = int(row.get("est_disponible", 0))
+        raw_is_excluded = int(row.get("is_excluded", 0))
+        missing_mode = int(
+            row.get("missing_exclusion_mode", MISSING_EXCLUSION_MODE_NONE)
+        )
+
+        status, effective_is_excluded = resolve_effective_status(
+            raw_available, raw_is_excluded, missing_mode
+        )
+        effective_available = 1 if status == 1 else 0
+
+        records.append(
+            (start_clipped, end_clipped, effective_available, effective_is_excluded)
+        )
 
     records.sort(key=lambda item: item[0])
     return AvailabilityTimeline(records)
