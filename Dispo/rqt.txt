@@ -1,0 +1,44 @@
+CREATE TABLE IF NOT EXISTS `dispo_blocs_ac` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `site` VARCHAR(100) NOT NULL,
+  `equipement_id` VARCHAR(100) NOT NULL,
+  `type_equipement` ENUM('AC') NOT NULL DEFAULT 'AC',
+  `date_debut` DATETIME NOT NULL,
+  `date_fin` DATETIME NOT NULL,
+  `est_disponible` TINYINT(1) NOT NULL COMMENT '1 = disponible, 0 = indisponible',
+  `cause` VARCHAR(255) DEFAULT NULL,
+  `raw_point_count` INT UNSIGNED DEFAULT 0,
+  `processed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `batch_id` VARCHAR(64) DEFAULT NULL,
+  `hash_signature` VARCHAR(64) DEFAULT NULL,
+  `duration_minutes` INT GENERATED ALWAYS AS (TIMESTAMPDIFF(MINUTE, date_debut, date_fin)) STORED,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_ac_equip_interval` (`equipement_id`,`date_debut`,`date_fin`),
+  KEY `idx_ac_equip_debut` (`equipement_id`,`date_debut`),
+  KEY `idx_ac_site_debut_fin` (`site`,`date_debut`,`date_fin`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Blocs consolidés AC (minutes -> blocs) issus d''Influx';
+
+
+-- Table pour BATT (DC1 + DC2)
+CREATE TABLE IF NOT EXISTS `dispo_blocs_batt` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `site` VARCHAR(100) NOT NULL,
+  `equipement_id` VARCHAR(100) NOT NULL,
+  `type_equipement` ENUM('BATT') NOT NULL DEFAULT 'BATT',
+  `date_debut` DATETIME NOT NULL,
+  `date_fin` DATETIME NOT NULL,
+  `est_disponible` TINYINT(1) NOT NULL COMMENT '1 = disponible, 0 = indisponible',
+  `cause` VARCHAR(255) DEFAULT NULL,
+  `raw_point_count` INT UNSIGNED DEFAULT 0,
+  `processed_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `batch_id` VARCHAR(64) DEFAULT NULL,
+  `hash_signature` VARCHAR(64) DEFAULT NULL,
+  `duration_minutes` INT GENERATED ALWAYS AS (TIMESTAMPDIFF(MINUTE, date_debut, date_fin)) STORED,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_batt_equip_interval` (`equipement_id`,`date_debut`,`date_fin`),
+  KEY `idx_batt_equip_debut` (`equipement_id`,`date_debut`),
+  KEY `idx_batt_site_debut_fin` (`site`,`date_debut`,`date_fin`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Blocs consolidés BATT (DC1, DC2) issus d''Influx';
+
